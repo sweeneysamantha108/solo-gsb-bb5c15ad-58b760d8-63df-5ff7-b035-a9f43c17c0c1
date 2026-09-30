@@ -137,6 +137,115 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   r = await api('GET', `/api/sessions/${sid}/state`);
   ok('GET state 返回最新已确认状态', r.status === 200 && r.json.stateVersion >= 9);
 
+  // ================= 多语言字幕 =================
+  console.log('\n—— 多语言字幕 ——');
+  r = await api('POST', '/api/sessions', { name: '多语言测试场' });
+  const sid2 = r.json.id;
+  const entries3 = [{ seq: 1, text: '你好' }, { seq: 2, text: '谢谢' }, { seq: 3, text: '再见' }];
+
+  // 11. 译文校验：各类非法一律拒绝
+  await expectFail('重复语言代码拒绝(PUT draft)', 'PUT', `/api/sessions/${sid2}/draft`,
+    { entries: entries3, translations: [{ seq: 1, lang: 'en', text: 'Hello' }, { seq: 1, lang: 'EN', text: 'Hi' }] }, 'DUPLICATE_LANG');
+  await expectFail('空译文拒绝', 'PUT', `/api/sessions/${sid2}/draft`,
+    { entries: entries3, translations: [{ seq: 1, lang: 'en', text: '  ' }] }, 'EMPTY_TRANSLATION');
+  await expectFail('引用不存在的原文序号拒绝', 'PUT', `/api/sessions/${sid2}/draft`,
+    { entries: entries3, translations: [{ seq: 9, lang: 'en', text: 'Nine' }] }, 'UNKNOWN_SEQ');
+  await expectFail('非法语言代码拒绝', 'PUT', `/api/sessions/${sid2}/draft`,
+    { entries: entries3, translations: [{ seq: 1, lang: '英语!', text: 'Hello' }] }, 'INVALID_LANG');
+  await expectFail('translations 非数组拒绝', 'PUT', `/api/sessions/${sid2}/draft`,
+    { entries: entries3, translations: 'en' }, 'INVALID_TRANSLATIONS');
+
+  // 12. 合法草稿（允许缺条：序号 2 无译文，序号 3 只有 en）
+  r = await api('PUT', `/api/sessions/${sid2}/draft`, {
+    entries: entries3,
+    translations: [
+      { seq: 1, lang: 'en', text: 'Hello' },
+      { seq: 1, lang: 'ja', text: 'こんにちは' },
+      { seq: 3, lang: 'en', text: 'Goodbye' },
+    ],
+  });
+  ok('保存含译文草稿（允许缺条）', r.status === 200 && r.json.count === 3 && r.json.translationCount === 3, JSON.stringify(r.json));
+  r = await api('GET', `/api/sessions/${sid2}/draft`);
+  ok('读取草稿含译文', r.status === 200 && r.json.translations.length === 3 &&
+    r.json.translations[0].lang === 'en' && r.json.translations[1].lang === 'ja');
+
+  // 13. 非法发布：拒绝且不生成部分版本
+  await expectFail('发布含非法译文拒绝', 'POST', `/api/sessions/${sid2}/publish`,
+    { entries: entries3, translations: [{ seq: 4, lang: 'en', text: 'Four' }] }, 'UNKNOWN_SEQ');
+  r = await api('GET', `/api/sessions/${sid2}/versions`);
+  ok('拒绝后未生成任何版本', r.status === 200 && r.json.versions.length === 0);
+
+  // 14. 合法发布：原文与译文固化到同一版本
+  r = await api('POST', `/api/sessions/${sid2}/publish`, {
+    entries: entries3,
+    translations: [
+      { seq: 1, lang: 'en', text: 'Hello' },
+      { seq: 1, lang: 'ja', text: 'こんにちは' },
+      { seq: 3, lang: 'en', text: 'Goodbye' },
+    ],
+  });
+  ok('发布多语言版本 v1', r.status === 200 && r.json.versionNo === 1 && r.json.translationCount === 3 &&
+    JSON.stringify(r.json.languages) === '["en","ja"]', JSON.stringify(r.json));
+  const mv1 = r.json.id;
+  r = await api('GET', `/api/sessions/${sid2}/versions/${mv1}`);
+  ok('版本详情含译文与语言列表', r.status === 200 && r.json.translations.length === 3 &&
+    JSON.stringify(r.json.languages) === '["en","ja"]');
+  r = await api('GET', `/api/sessions/${sid2}/versions`);
+  ok('版本列表含语言列表', r.status === 200 && JSON.stringify(r.json.versions[0].languages) === '["en","ja"]');
+
+  // 15. 演出状态携带当前条目译文与版本语言
+  r = await api('POST', `/api/sessions/${sid2}/control/grant`, { operator: '多语言操作员', ttl: 60 });
+  const tokenM = r.json.token;
+  r = await api('POST', `/api/sessions/${sid2}/ops`, { action: 'load', versionId: mv1, token: tokenM, stateVersion: 1 });
+  ok('载入多语言版本', r.status === 200 && JSON.stringify(r.json.version.languages) === '["en","ja"]', JSON.stringify(r.json.version));
+  r = await api('POST', `/api/sessions/${sid2}/ops`, { action: 'advance', token: tokenM, stateVersion: 2 });
+  ok('第1条含 en/ja 译文', r.status === 200 && r.json.current.translations &&
+    r.json.current.translations.en === 'Hello' && r.json.current.translations.ja === 'こんにちは', JSON.stringify(r.json.current));
+  r = await api('POST', `/api/sessions/${sid2}/ops`, { action: 'advance', token: tokenM, stateVersion: 3 });
+  ok('第2条缺译文（观众端回退原文）', r.status === 200 && r.json.current.text === '谢谢' && !r.json.current.translations);
+  r = await api('POST', `/api/sessions/${sid2}/ops`, { action: 'advance', token: tokenM, stateVersion: 4 });
+  ok('第3条仅 en 译文', r.status === 200 && r.json.current.translations &&
+    r.json.current.translations.en === 'Goodbye' && !('ja' in r.json.current.translations));
+
+  // 16. 演出中发布新版本：已载入版本的译文不变
+  r = await api('POST', `/api/sessions/${sid2}/publish`, {
+    entries: [{ seq: 1, text: '新原文' }],
+    translations: [{ seq: 1, lang: 'en', text: 'Brand new' }],
+  });
+  ok('演出中发布 v2 成功', r.status === 200 && r.json.versionNo === 2);
+  r = await api('GET', `/api/sessions/${sid2}/state`);
+  ok('已载入版本译文不受新发布影响', r.status === 200 && r.json.activeVersionId === mv1 &&
+    r.json.current.translations.en === 'Goodbye' && JSON.stringify(r.json.version.languages) === '["en","ja"]',
+    JSON.stringify(r.json.current));
+
+  // 17. WebSocket hello 即下发最新已确认状态（含译文），供断线重连/服务重启恢复
+  {
+    const WebSocket = require('ws');
+    const hello = await new Promise((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:8080/ws?sid=${sid2}`);
+      const timer = setTimeout(() => reject(new Error('WS hello 超时')), 5000);
+      ws.on('message', (data) => {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === 'hello') { clearTimeout(timer); ws.close(); resolve(msg); }
+      });
+      ws.on('error', reject);
+    });
+    ok('WS hello 含最新已确认字幕与译文', hello.state && hello.state.current &&
+      hello.state.current.seq === 3 && hello.state.current.translations.en === 'Goodbye' &&
+      JSON.stringify(hello.state.version.languages) === '["en","ja"]', JSON.stringify(hello.state && hello.state.current));
+  }
+
+  // 18. 兼容：不带 translations 的旧式调用仍可用
+  r = await api('POST', '/api/sessions', { name: '单语兼容场' });
+  const sid3 = r.json.id;
+  r = await api('PUT', `/api/sessions/${sid3}/draft`, { entries: [{ seq: 1, text: '只有原文' }] });
+  ok('旧式 PUT draft（无 translations）', r.status === 200 && r.json.translationCount === 0);
+  r = await api('POST', `/api/sessions/${sid3}/publish`, { entries: [{ seq: 1, text: '只有原文' }] });
+  ok('旧式发布（无 translations）语言列表为空', r.status === 200 && r.json.versionNo === 1 &&
+    JSON.stringify(r.json.languages) === '[]');
+  r = await api('GET', `/api/sessions/${sid3}/draft`);
+  ok('旧式 GET draft 返回空译文数组', r.status === 200 && Array.isArray(r.json.translations) && r.json.translations.length === 0);
+
   console.log(`\n结果: ${pass} 通过, ${fail} 失败`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error('测试异常', e); process.exit(1); });

@@ -23,7 +23,7 @@
     <h2>草稿字幕（发布后的修改仅进入草稿，不影响正在演出的版本）</h2>
     <table class="entries">
       <thead>
-        <tr><th class="col-seq">序号</th><th>字幕内容</th><th class="col-del"></th></tr>
+        <tr><th class="col-seq">序号</th><th>字幕内容（原文）</th><th class="col-del"></th></tr>
       </thead>
       <tbody id="entry-body"></tbody>
     </table>
@@ -35,6 +35,23 @@
     </div>
     <p class="muted small" style="margin-bottom:0">
       规则：序号必须为正整数且不可重复；字幕内容不能为空；空草稿不能发布。
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>草稿译文（可选，按字幕序号录入；发布时与原文一起固化到同一演出版本）</h2>
+    <table class="entries">
+      <thead>
+        <tr><th class="col-seq">字幕序号</th><th class="col-lang">语言代码</th><th>译文</th><th class="col-del"></th></tr>
+      </thead>
+      <tbody id="trans-body"></tbody>
+    </table>
+    <div class="row" style="margin-top:12px">
+      <div style="flex:0 0 auto"><button class="ghost" id="add-trans-btn">＋ 添加译文</button></div>
+    </div>
+    <p class="muted small" style="margin-bottom:0">
+      规则：语言代码形如 <code>en</code>、<code>ja</code>、<code>zh-CN</code>（统一按小写保存）；同一序号下语言代码不可重复；
+      译文不能为空；序号必须存在于上方字幕中。译文允许缺条——观众设备选择了某语言而当前字幕没有该语言译文时，自动显示原文。
     </p>
   </div>
 
@@ -82,11 +99,43 @@ function readRows() {
 
 document.getElementById('add-btn').addEventListener('click', () => addRow());
 
+// ------------------------------------------------------------ 译文录入
+
+const transTbody = document.getElementById('trans-body');
+
+function transRowHtml(seq, lang, text) {
+  const tr = document.createElement('tr');
+  tr.className = 'trans-row';
+  tr.innerHTML = `
+    <td class="col-seq"><input type="number" min="1" step="1" class="f-tseq" value="${esc(seq)}" placeholder="字幕序号"></td>
+    <td class="col-lang"><input type="text" class="f-tlang" value="${esc(lang)}" placeholder="如 en" maxlength="35"></td>
+    <td><textarea rows="1" class="f-ttext" placeholder="输入该语言译文…">${esc(text)}</textarea></td>
+    <td class="col-del"><button class="del-btn" title="删除此行">✕</button></td>`;
+  tr.querySelector('.del-btn').addEventListener('click', () => { tr.remove(); });
+  return tr;
+}
+
+function addTransRow(seq = '', lang = '', text = '') {
+  transTbody.appendChild(transRowHtml(seq, lang, text));
+}
+
+function readTransRows() {
+  return [...document.querySelectorAll('.trans-row')].map((tr) => ({
+    seq: tr.querySelector('.f-tseq').value,
+    lang: tr.querySelector('.f-tlang').value,
+    text: tr.querySelector('.f-ttext').value,
+  }));
+}
+
+document.getElementById('add-trans-btn').addEventListener('click', () => addTransRow());
+
 async function loadDraft() {
-  const { entries } = await Api.get(`/api/sessions/${sid}/draft`);
+  const { entries, translations } = await Api.get(`/api/sessions/${sid}/draft`);
   tbody.innerHTML = '';
   entries.forEach((e) => addRow(e.seq, e.text));
   if (!entries.length) addRow();
+  transTbody.innerHTML = '';
+  (translations || []).forEach((t) => addTransRow(t.seq, t.lang, t.text));
 }
 
 async function loadVersions() {
@@ -102,9 +151,10 @@ async function loadVersions() {
   } else {
     ul.innerHTML = versions.map((v) => {
       const active = liveState && liveState.activeVersionId === v.id;
+      const langs = v.languages && v.languages.length ? ` · 语言: ${v.languages.join(', ')}` : '';
       return `<li>
         <span class="vno">v${v.versionNo}</span>
-        <span>${fmtTime(v.publishedAt)} · ${v.count} 条</span>
+        <span>${fmtTime(v.publishedAt)} · ${v.count} 条${esc(langs)}</span>
         ${active ? '<span class="badge live">● 演出中</span>' : ''}
       </li>`;
     }).join('');
@@ -119,16 +169,17 @@ async function loadVersions() {
 
 document.getElementById('save-btn').addEventListener('click', async () => {
   try {
-    const r = await Api.put(`/api/sessions/${sid}/draft`, { entries: readRows() });
-    toast(`草稿已保存（${r.count} 条）`, 'ok');
+    const r = await Api.put(`/api/sessions/${sid}/draft`, { entries: readRows(), translations: readTransRows() });
+    toast(`草稿已保存（${r.count} 条字幕，${r.translationCount} 条译文）`, 'ok');
     await loadDraft();
   } catch (err) { toast(err.message); }
 });
 
 document.getElementById('publish-btn').addEventListener('click', async () => {
   try {
-    const v = await Api.post(`/api/sessions/${sid}/publish`, { entries: readRows() });
-    toast(`已发布 v${v.versionNo}（${v.count} 条）。草稿已清空，可继续编排下一版。`, 'ok');
+    const v = await Api.post(`/api/sessions/${sid}/publish`, { entries: readRows(), translations: readTransRows() });
+    const langs = v.languages && v.languages.length ? `，语言: ${v.languages.join(', ')}` : '';
+    toast(`已发布 v${v.versionNo}（${v.count} 条字幕，${v.translationCount} 条译文${langs}）。草稿已清空，可继续编排下一版。`, 'ok');
     await Promise.all([loadDraft(), loadVersions()]);
   } catch (err) { toast(err.message); }
 });

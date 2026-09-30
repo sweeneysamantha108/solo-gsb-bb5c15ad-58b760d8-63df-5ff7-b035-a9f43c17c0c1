@@ -51,6 +51,13 @@ CREATE TABLE IF NOT EXISTS entries(
   seq INTEGER NOT NULL,
   text TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS translations(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
+  seq INTEGER NOT NULL,
+  lang TEXT NOT NULL,
+  text TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS show_state(
   session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
   active_version_id INTEGER,
@@ -65,6 +72,7 @@ CREATE TABLE IF NOT EXISTS control(
 );
 CREATE INDEX IF NOT EXISTS idx_versions_session ON versions(session_id);
 CREATE INDEX IF NOT EXISTS idx_entries_version ON entries(version_id);
+CREATE INDEX IF NOT EXISTS idx_translations_version ON translations(version_id);
 `);
 
 // ---------------------------------------------------------------- 工具
@@ -112,6 +120,12 @@ function entryCount(versionId) {
   return db.prepare('SELECT COUNT(*) AS n FROM entries WHERE version_id=?').get(versionId).n;
 }
 
+/** 某版本已发布的语言代码列表（去重、按代码排序） */
+function languagesOf(versionId) {
+  return db.prepare('SELECT DISTINCT lang FROM translations WHERE version_id=? ORDER BY lang')
+    .all(versionId).map((r) => r.lang);
+}
+
 /** 组装“当前已确认状态”——REST 与 WebSocket 推送共用，也是重启后恢复的来源 */
 function getState(sid) {
   const st = db.prepare(
@@ -125,12 +139,19 @@ function getState(sid) {
     const v = db.prepare(
       'SELECT id, version_no AS versionNo, published_at AS publishedAt FROM versions WHERE id=?'
     ).get(st.activeVersionId);
-    if (v) version = { id: v.id, versionNo: v.versionNo, publishedAt: v.publishedAt };
+    if (v) version = { id: v.id, versionNo: v.versionNo, publishedAt: v.publishedAt, languages: languagesOf(v.id) };
     if (st.pos != null) {
       const e = db.prepare(
         'SELECT seq, text FROM entries WHERE version_id=? ORDER BY seq ASC LIMIT 1 OFFSET ?'
       ).get(st.activeVersionId, st.pos - 1);
-      if (e) current = { seq: e.seq, text: e.text };
+      if (e) {
+        current = { seq: e.seq, text: e.text };
+        const trs = db.prepare(
+          'SELECT lang, text FROM translations WHERE version_id=? AND seq=? ORDER BY lang'
+        ).all(st.activeVersionId, e.seq);
+        // 当前条目的全部已发布译文，观众端按设备所选语言取用；缺译文时回退原文
+        if (trs.length) current.translations = Object.fromEntries(trs.map((t) => [t.lang, t.text]));
+      }
     }
   }
 
@@ -173,6 +194,52 @@ function parseEntries(raw) {
   return out;
 }
 
+/** 语言代码：en、eng、zh-CN、zh-Hant 等形式；统一以小写存储，保证重复检测一致 */
+const LANG_RE = /^[a-z]{2,8}(-[a-z0-9]{1,8})*$/;
+
+/**
+ * 校验译文条目（允许缺条，即某些序号可以没有任何译文）：
+ *  - 语言代码必须合法；
+ *  - 同一字幕序号下语言代码不可重复；
+ *  - 译文文本不能为空；
+ *  - 字幕序号必须存在于本次提交的原文条目中。
+ * 任一不满足即整体拒绝（调用方在事务外先校验，不会产生部分写入）。
+ */
+function parseTranslations(raw, entrySeqs) {
+  if (raw == null) return []; // 兼容旧客户端：不传 translations 视为无译文
+  if (!Array.isArray(raw)) throw httpError(400, 'INVALID_TRANSLATIONS', '译文条目必须是数组');
+  const seen = new Set(); // `${seq} ${lang}`
+  const out = [];
+  raw.forEach((item, i) => {
+    let seq = item && item.seq;
+    if (typeof seq === 'string' && seq.trim() !== '' && Number.isInteger(Number(seq.trim()))) {
+      seq = Number(seq.trim());
+    }
+    if (!Number.isInteger(seq) || seq < 1) {
+      throw httpError(400, 'INVALID_SEQ', `第 ${i + 1} 条译文的字幕序号无效：必须是正整数`);
+    }
+    if (!entrySeqs.has(seq)) {
+      throw httpError(400, 'UNKNOWN_SEQ', `第 ${i + 1} 条译文引用了不存在的原文序号 ${seq}，拒绝保存`);
+    }
+    const lang = typeof item.lang === 'string' ? item.lang.trim().toLowerCase() : '';
+    if (!lang || lang.length > 35 || !LANG_RE.test(lang)) {
+      throw httpError(400, 'INVALID_LANG',
+        `序号 ${seq} 的译文语言代码无效${item.lang ? `：「${String(item.lang).slice(0, 40)}」` : '（不能为空）'}，应使用 en、zh-CN 这类代码`);
+    }
+    if (seen.has(`${seq} ${lang}`)) {
+      throw httpError(409, 'DUPLICATE_LANG', `序号 ${seq} 的语言代码「${lang}」重复，拒绝保存`);
+    }
+    seen.add(`${seq} ${lang}`);
+    const text = typeof item.text === 'string' ? item.text.trim() : '';
+    if (text === '') {
+      throw httpError(400, 'EMPTY_TRANSLATION', `序号 ${seq}（${lang}）的译文为空，拒绝保存`);
+    }
+    out.push({ seq, lang, text });
+  });
+  out.sort((a, b) => a.seq - b.seq || a.lang.localeCompare(b.lang));
+  return out;
+}
+
 function newId() {
   return crypto.randomBytes(6).toString('hex'); // 12 位十六进制
 }
@@ -205,22 +272,28 @@ function sessionDetail(sid) {
   return { id: s.id, name: s.name, createdAt: s.created_at, state: getState(sid) };
 }
 
-function replaceDraft(sid, entries) {
+function replaceDraft(sid, entries, translations) {
   const s = getSessionOr404(sid);
   const draftId = getDraftId(sid);
   withTx(() => {
     db.prepare('DELETE FROM entries WHERE version_id=?').run(draftId);
+    db.prepare('DELETE FROM translations WHERE version_id=?').run(draftId);
     const ins = db.prepare('INSERT INTO entries(version_id, seq, text) VALUES(?,?,?)');
     for (const e of entries) ins.run(draftId, e.seq, e.text);
+    const insT = db.prepare('INSERT INTO translations(version_id, seq, lang, text) VALUES(?,?,?,?)');
+    for (const t of translations) insT.run(draftId, t.seq, t.lang, t.text);
   });
-  return { draftId, count: entries.length };
+  return { draftId, count: entries.length, translationCount: translations.length };
 }
 
 function getDraft(sid) {
   getSessionOr404(sid);
   const draftId = getDraftId(sid);
   const rows = db.prepare('SELECT seq, text FROM entries WHERE version_id=? ORDER BY seq ASC').all(draftId);
-  return { draftId, entries: rows };
+  const translations = db.prepare(
+    'SELECT seq, lang, text FROM translations WHERE version_id=? ORDER BY seq ASC, lang ASC'
+  ).all(draftId);
+  return { draftId, entries: rows, translations };
 }
 
 function listVersions(sid) {
@@ -232,6 +305,7 @@ function listVersions(sid) {
     WHERE v.session_id=? AND v.kind='published'
     ORDER BY v.version_no DESC
   `).all(sid);
+  for (const r of rows) r.languages = languagesOf(r.id);
   return rows;
 }
 
@@ -242,21 +316,29 @@ function getVersion(sid, vid) {
   ).get(vid, sid);
   if (!v) throw httpError(404, 'VERSION_NOT_FOUND', '演出版本不存在');
   const entries = db.prepare('SELECT seq, text FROM entries WHERE version_id=? ORDER BY seq ASC').all(vid);
-  return { ...v, entries };
+  const translations = db.prepare(
+    'SELECT seq, lang, text FROM translations WHERE version_id=? ORDER BY seq ASC, lang ASC'
+  ).all(vid);
+  return { ...v, languages: languagesOf(vid), entries, translations };
 }
 
-/** 发布草稿为不可变演出版本，并开启一份新的空草稿；演出中的状态不受影响 */
+/** 发布草稿为不可变演出版本（原文与译文一起固化），并开启一份新的空草稿；演出中的状态不受影响 */
 function publish(sid, body) {
   getSessionOr404(sid);
   const entries = parseEntries(body.entries);
   if (entries.length === 0) throw httpError(400, 'EMPTY_VERSION', '演出版本不能为空，拒绝发布');
+  // 译文校验先于任何写库：任一非法即整体拒绝，不会生成部分版本
+  const translations = parseTranslations(body.translations, new Set(entries.map((e) => e.seq)));
 
   const result = withTx(() => {
     const oldDraftId = getDraftId(sid);
-    // 先把本次编辑固化到旧草稿
+    // 先把本次编辑（原文 + 译文）固化到旧草稿
     db.prepare('DELETE FROM entries WHERE version_id=?').run(oldDraftId);
+    db.prepare('DELETE FROM translations WHERE version_id=?').run(oldDraftId);
     const ins = db.prepare('INSERT INTO entries(version_id, seq, text) VALUES(?,?,?)');
     for (const e of entries) ins.run(oldDraftId, e.seq, e.text);
+    const insT = db.prepare('INSERT INTO translations(version_id, seq, lang, text) VALUES(?,?,?,?)');
+    for (const t of translations) insT.run(oldDraftId, t.seq, t.lang, t.text);
 
     const maxRow = db.prepare(
       "SELECT COALESCE(MAX(version_no),0) AS m FROM versions WHERE session_id=? AND kind='published'"
@@ -269,11 +351,16 @@ function publish(sid, body) {
     const pubId = Number(pubInfo.lastInsertRowid);
     const copy = db.prepare('INSERT INTO entries(version_id, seq, text) SELECT ?, seq, text FROM entries WHERE version_id=?');
     copy.run(pubId, oldDraftId);
+    const copyT = db.prepare('INSERT INTO translations(version_id, seq, lang, text) SELECT ?, seq, lang, text FROM translations WHERE version_id=?');
+    copyT.run(pubId, oldDraftId);
 
     // 旧草稿连同其条目删除，另开一份空草稿承载之后的修改
     db.prepare('DELETE FROM versions WHERE id=?').run(oldDraftId);
     db.prepare('INSERT INTO versions(session_id, kind, created_at) VALUES(?, \'draft\', ?)').run(sid, now);
-    return { id: pubId, versionNo, publishedAt: now, count: entries.length };
+    return {
+      id: pubId, versionNo, publishedAt: now,
+      count: entries.length, translationCount: translations.length, languages: languagesOf(pubId),
+    };
   });
   return result;
 }
@@ -476,7 +563,11 @@ const routes = [
   ['POST',   /^\/api\/sessions$/,                           (p, b) => createSession(b)],
   ['GET',    /^\/api\/sessions\/([0-9a-f]{12})$/,           (p) => sessionDetail(p[0])],
   ['GET',    /^\/api\/sessions\/([0-9a-f]{12})\/draft$/,    (p) => getDraft(p[0])],
-  ['PUT',    /^\/api\/sessions\/([0-9a-f]{12})\/draft$/,    (p, b) => replaceDraft(p[0], parseEntries(b.entries))],
+  ['PUT',    /^\/api\/sessions\/([0-9a-f]{12})\/draft$/,    (p, b) => {
+    const entries = parseEntries(b.entries);
+    const translations = parseTranslations(b.translations, new Set(entries.map((e) => e.seq)));
+    return replaceDraft(p[0], entries, translations);
+  }],
   ['POST',   /^\/api\/sessions\/([0-9a-f]{12})\/publish$/,  (p, b) => publish(p[0], b)],
   ['GET',    /^\/api\/sessions\/([0-9a-f]{12})\/versions$/, (p) => ({ versions: listVersions(p[0]) })],
   ['GET',    /^\/api\/sessions\/([0-9a-f]{12})\/versions\/(\d+)$/, (p) => getVersion(p[0], Number(p[1]))],

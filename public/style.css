@@ -127,6 +127,7 @@ table.entries th {
 table.entries td { padding: 6px 8px; }
 table.entries input, table.entries textarea { font-size: 14px; }
 table.entries .col-seq { width: 90px; }
+table.entries .col-lang { width: 130px; }
 table.entries .col-del { width: 44px; }
 table.entries .del-btn {
   background: transparent; color: var(--muted); padding: 4px 8px; font-size: 16px;
@@ -206,6 +207,16 @@ body.audience { background: #000; height: 100vh; overflow: hidden; }
   font-size: 12px;
 }
 .aud-hud .conn-pill { background: rgba(255,255,255,.04); }
+.aud-lang {
+  width: auto;
+  background: rgba(255,255,255,.06);
+  color: #bbb;
+  border: 1px solid #333;
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 13px;
+}
+.aud-lang:focus { outline: 1px solid #555; border-color: #555; }
 .aud-seq {
   position: fixed; left: 18px; bottom: 14px; color: #3a3a3a; font-size: 13px;
 }

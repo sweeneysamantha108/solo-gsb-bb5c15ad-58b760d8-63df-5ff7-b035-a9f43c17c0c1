@@ -190,7 +190,7 @@ async function refreshVersions(selectId) {
     sel.innerHTML = '<option value="">（暂无已发布版本，请编辑者先发布）</option>';
   } else {
     sel.innerHTML = vs.map((v) =>
-      `<option value="${v.id}" ${String(v.id) === String(selectId) ? 'selected' : ''}>v${v.versionNo} · ${v.count} 条 · ${fmtTime(v.publishedAt)}</option>`
+      `<option value="${v.id}" ${String(v.id) === String(selectId) ? 'selected' : ''}>v${v.versionNo} · ${v.count} 条${v.languages && v.languages.length ? ' · ' + v.languages.join('/') : ''} · ${fmtTime(v.publishedAt)}</option>`
     ).join('');
   }
 }

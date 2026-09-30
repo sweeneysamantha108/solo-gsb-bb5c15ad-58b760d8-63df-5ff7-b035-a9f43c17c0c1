@@ -8,7 +8,10 @@
 </head>
 <body class="audience">
   <div class="aud-stage cleared" id="stage">正在连接走词台…</div>
-  <div class="aud-hud"><span id="conn-pill" class="conn-pill connecting">连接中…</span></div>
+  <div class="aud-hud">
+    <select id="lang-select" class="aud-lang" style="display:none" title="选择本设备显示的语言"></select>
+    <span id="conn-pill" class="conn-pill connecting">连接中…</span>
+  </div>
   <div class="aud-seq" id="seq-hud"></div>
 
 <script src="/common.js"></script>
@@ -20,24 +23,66 @@ if (!sid) location.replace('/');
 
 const stage = document.getElementById('stage');
 const seqHud = document.getElementById('seq-hud');
+const langSelect = document.getElementById('lang-select');
 
+// 设备所选语言保存在本设备 localStorage（与服务端无关）：
+// 断线重连、服务重启后本设备自动恢复所选语言；'' 表示显示原文。
+const LANG_KEY = 'prompter:audience-lang';
+let preferredLang = localStorage.getItem(LANG_KEY) || '';
+let lastState = null;
+
+function versionLangs(st) {
+  return (st && st.version && Array.isArray(st.version.languages)) ? st.version.languages : [];
+}
+
+/** 设备偏好语言在当前版本中不存在时，回退为原文 */
+function effectiveLang(st) {
+  const langs = versionLangs(st);
+  return langs.includes(preferredLang) ? preferredLang : '';
+}
+
+function renderLangSelect(st) {
+  const langs = versionLangs(st);
+  if (!langs.length) { langSelect.style.display = 'none'; return; }
+  langSelect.style.display = '';
+  langSelect.innerHTML = '<option value="">原文</option>' +
+    langs.map((l) => `<option value="${esc(l)}">${esc(l)}</option>`).join('');
+  langSelect.value = effectiveLang(st);
+}
+
+// 切换语言只改变本设备显示：不发起任何会改变全场进度/状态版本/控制权的请求。
+langSelect.addEventListener('change', () => {
+  preferredLang = langSelect.value;
+  localStorage.setItem(LANG_KEY, preferredLang);
+  render(); // 基于最新已确认状态重渲染本设备画面
+});
+
+// 渲染是 (最新已确认状态, 本设备语言) 的纯函数：
+// 切换语言与舞台推进无论谁先谁后，最终画面都收敛到最新进度对应的文本。
 function render(st) {
-  if (st && st.current) {
+  if (st) lastState = st;
+  st = lastState;
+  if (!st) return;
+  renderLangSelect(st);
+  const lang = effectiveLang(st);
+  if (st.current) {
+    // 当前字幕缺该语言译文时显示原文
+    const t = (lang && st.current.translations && st.current.translations[lang]) || st.current.text;
     stage.classList.remove('cleared');
-    stage.textContent = st.current.text;
-    seqHud.textContent = `v${st.version ? st.version.versionNo : '-'} · ${st.pos}/${st.total} · #${st.current.seq}`;
-    document.title = `▶ ${st.current.text.slice(0, 20)}`;
+    stage.textContent = t;
+    seqHud.textContent = `v${st.version ? st.version.versionNo : '-'} · ${st.pos}/${st.total} · #${st.current.seq}${lang ? ' · ' + lang : ''}`;
+    document.title = `▶ ${t.slice(0, 20)}`;
   } else {
     stage.classList.add('cleared');
-    stage.textContent = st && st.activeVersionId ? '— 清屏 —' : '等待演出开始…';
+    stage.textContent = st.activeVersionId ? '— 清屏 —' : '等待演出开始…';
     seqHud.textContent = '';
     document.title = '观众 · 走词台';
   }
 }
 
 // 断线自动重连；重连后服务器 hello 立即下发最新“已确认”状态，
-// 服务重启后同样从 SQLite 恢复。
-connectWS({ onState: render });
+// 服务重启后同样从 SQLite 恢复；本设备语言选择由 localStorage 恢复。
+connectWS({ onState: (st) => render(st) });
 </script>
 </body>
 </html>
