@@ -189,9 +189,10 @@ async function refreshVersions(selectId) {
   if (!vs.length) {
     sel.innerHTML = '<option value="">（暂无已发布版本，请编辑者先发布）</option>';
   } else {
-    sel.innerHTML = vs.map((v) =>
-      `<option value="${v.id}" ${String(v.id) === String(selectId) ? 'selected' : ''}>v${v.versionNo} · ${v.count} 条 · ${fmtTime(v.publishedAt)}</option>`
-    ).join('');
+    sel.innerHTML = vs.map((v) => {
+      const langTxt = v.langs && v.langs.length ? `｜语言: 原文/${v.langs.join('/')}` : '｜仅原文';
+      return `<option value="${v.id}" ${String(v.id) === String(selectId) ? 'selected' : ''}>v${v.versionNo} · ${v.count} 条 · ${fmtTime(v.publishedAt)}${langTxt}</option>`;
+    }).join('');
   }
 }
 

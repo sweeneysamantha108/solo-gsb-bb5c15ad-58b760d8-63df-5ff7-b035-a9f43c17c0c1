@@ -8,7 +8,10 @@
 </head>
 <body class="audience">
   <div class="aud-stage cleared" id="stage">正在连接走词台…</div>
-  <div class="aud-hud"><span id="conn-pill" class="conn-pill connecting">连接中…</span></div>
+  <div class="aud-hud">
+    <select id="lang-select" class="aud-lang" title="仅在本设备切换显示语言" aria-label="显示语言"></select>
+    <span id="conn-pill" class="conn-pill connecting">连接中…</span>
+  </div>
   <div class="aud-seq" id="seq-hud"></div>
 
 <script src="/common.js"></script>
@@ -20,13 +23,52 @@ if (!sid) location.replace('/');
 
 const stage = document.getElementById('stage');
 const seqHud = document.getElementById('seq-hud');
+const langSelect = document.getElementById('lang-select');
+const prefKey = `prompter:${sid}:lang`;
 
-function render(st) {
+/**
+ * 多语言显示完全是本设备的本地行为：
+ *  - 所选语言只存在本设备 localStorage，并只触发只读 GET，不发送任何舞台操作，
+ *    因此不改变全场进度、状态版本 stateVersion，也与控制权无关；
+ *  - 译文按“已发布版本”拉取缓存；某条缺译文时回退显示原文；
+ *  - 无论语言切换与推进以什么顺序到达，渲染都由「最新状态 × 当前语言缓存」组合得出，
+ *    最终只显示最新进度对应的文本。
+ */
+let latest = null;          // 最新已确认舞台状态（hello/state 推送）
+let chosenLang = localStorage.getItem(prefKey) || ''; // '' = 原文
+let contents = new Map();   // versionId -> { languages, bySeq, lang }
+let inflight = new Set();   // 正在拉取的版本，避免重复请求
+
+function currentText(st, content) {
+  if (!st || !st.current) return null;
+  if (content && content.lang) {
+    const t = content.bySeq.get(st.current.seq);
+    if (t) return { text: t, translated: true };
+  }
+  return { text: st.current.text, translated: false };
+}
+
+function buildOptions(st, content) {
+  const langs = content ? content.languages : [];
+  const cur = chosenLang || '';
+  const opts = ['<option value="">原文（默认）</option>']
+    .concat(langs.map((l) => `<option value="${esc(l)}"${l === cur ? ' selected' : ''}>${esc(l)}</option>`));
+  langSelect.innerHTML = opts.join('');
+  // 偏好语言不在本版本中：下拉显示“原文”，但保留偏好，等其他版本仍可生效
+  langSelect.value = langs.includes(cur) ? cur : '';
+  langSelect.style.display = langs.length ? '' : 'none';
+}
+
+function render() {
+  const st = latest;
   if (st && st.current) {
+    const content = st.activeVersionId != null ? contents.get(st.activeVersionId) : null;
+    const shown = currentText(st, content);
     stage.classList.remove('cleared');
-    stage.textContent = st.current.text;
-    seqHud.textContent = `v${st.version ? st.version.versionNo : '-'} · ${st.pos}/${st.total} · #${st.current.seq}`;
-    document.title = `▶ ${st.current.text.slice(0, 20)}`;
+    stage.textContent = shown.text;
+    const langTag = shown.translated ? ` · ${content.lang}` : (content && content.lang ? ` · 原文（缺译文）` : '');
+    seqHud.textContent = `v${st.version ? st.version.versionNo : '-'} · ${st.pos}/${st.total} · #${st.current.seq}${langTag}`;
+    document.title = `▶ ${shown.text.slice(0, 20)}`;
   } else {
     stage.classList.add('cleared');
     stage.textContent = st && st.activeVersionId ? '— 清屏 —' : '等待演出开始…';
@@ -35,9 +77,54 @@ function render(st) {
   }
 }
 
+/** 拉取某版本在所选语言下的内容；失败不影响原文显示 */
+async function ensureContent(versionId) {
+  if (versionId == null || inflight.has(versionId)) return;
+  inflight.add(versionId);
+  try {
+    const q = chosenLang ? `?lang=${encodeURIComponent(chosenLang)}` : '';
+    const c = await Api.get(`/api/sessions/${sid}/versions/${versionId}/content${q}`);
+    contents.set(versionId, {
+      languages: c.languages,
+      lang: c.lang,
+      bySeq: new Map(c.translations.map((t) => [t.seq, t.text])),
+    });
+    if (latest && latest.activeVersionId === versionId) {
+      buildOptions(latest, contents.get(versionId));
+      render();
+    }
+  } catch {
+    // 网络抖动等：保留原文，WS/下次切换会再拉
+  } finally {
+    inflight.delete(versionId);
+  }
+}
+
+function onState(st) {
+  latest = st;
+  const content = st.activeVersionId != null ? contents.get(st.activeVersionId) : null;
+  if (content) buildOptions(st, content);
+  else langSelect.style.display = 'none';
+  render();
+  if (st.activeVersionId != null && !contents.has(st.activeVersionId)) {
+    ensureContent(st.activeVersionId);
+  }
+}
+
+langSelect.addEventListener('change', () => {
+  chosenLang = langSelect.value;
+  if (chosenLang) localStorage.setItem(prefKey, chosenLang);
+  else localStorage.removeItem(prefKey);
+  // 仅本设备：清掉译文缓存后按新语言重拉，再与“最新进度”组合渲染；不发送任何状态变更
+  contents.clear();
+  if (latest && latest.activeVersionId != null) {
+    ensureContent(latest.activeVersionId).then(render);
+  }
+});
+
 // 断线自动重连；重连后服务器 hello 立即下发最新“已确认”状态，
-// 服务重启后同样从 SQLite 恢复。
-connectWS({ onState: render });
+// 语言偏好存于本设备 localStorage，服务重启后同样二者齐备并恢复显示。
+connectWS({ onState });
 </script>
 </body>
 </html>

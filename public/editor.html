@@ -20,21 +20,28 @@
 
 <div class="container">
   <div class="card">
-    <h2>草稿字幕（发布后的修改仅进入草稿，不影响正在演出的版本）</h2>
-    <table class="entries">
-      <thead>
-        <tr><th class="col-seq">序号</th><th>字幕内容</th><th class="col-del"></th></tr>
-      </thead>
-      <tbody id="entry-body"></tbody>
-    </table>
+    <h2>草稿字幕（原文 + 各语言译文；发布后的修改仅进入草稿，不影响正在演出的版本）</h2>
+    <div class="table-wrap">
+      <table class="entries">
+        <thead id="entry-head"></thead>
+        <tbody id="entry-body"></tbody>
+      </table>
+    </div>
     <div class="row" style="margin-top:12px">
-      <div style="flex:0 0 auto"><button class="ghost" id="add-btn">＋ 添加一行</button></div>
+      <div style="flex:0 0 auto"><button class="ghost" id="add-btn">＋ 添加一行原文</button></div>
+      <div style="flex:0 0 auto;display:flex;gap:8px;align-items:center">
+        <input type="text" id="new-lang" class="lang-input" placeholder="语言代码 如 en / ja / zh-hans"
+               style="width:220px" maxlength="24">
+        <button class="ghost" id="add-lang-btn">＋ 添加语言列</button>
+      </div>
       <div class="spacer" style="flex:1"></div>
       <div style="flex:0 0 auto"><button class="ghost" id="save-btn">保存草稿</button></div>
       <div style="flex:0 0 auto"><button id="publish-btn">发布为演出版本</button></div>
     </div>
     <p class="muted small" style="margin-bottom:0">
-      规则：序号必须为正整数且不可重复；字幕内容不能为空；空草稿不能发布。
+      规则：原文序号必须为正整数且不可重复、原文不能为空；每种语言只可有一列，语言代码形如 <code>en</code>、<code>ja</code>、<code>zh-hans</code>；
+      <b>译文允许缺条</b>（该格留空即不翻译，观众端自动回退原文）；但同一语言内序号不可重复、已填译文不能为空，且只可引用存在的原文序号。
+      任一校验不通过都会整体拒绝，不会生成部分版本。
     </p>
   </div>
 
@@ -56,37 +63,124 @@ document.getElementById('nav-aud').href = '/audience.html?sid=' + sid;
 
 let liveState = null;
 
-const tbody = document.getElementById('entry-body');
+// 语言列仅为编辑器本地布局偏好（与服务器无关），按场次记忆
+const langPrefKey = `prompter:${sid}:editorLangs`;
+let langs = JSON.parse(localStorage.getItem(langPrefKey) || '[]');
 
-function rowHtml(seq, text) {
+const tbody = document.getElementById('entry-body');
+const thead = document.getElementById('entry-head');
+
+function saveLangPrefs() {
+  localStorage.setItem(langPrefKey, JSON.stringify(langs));
+}
+
+function renderHead() {
+  const th = (label, cls, title) =>
+    `<th class="${cls || ''}"${title ? ` title="${esc(title)}"` : ''}>${label}</th>`;
+  let html = '<tr>' + th('序号', 'col-seq') + th('原文（始终显示的兜底语言）');
+  langs.forEach((lang) => {
+    html += th(`<span>译文 · ${esc(lang)}</span> <button class="del-lang" data-lang="${esc(lang)}" title="删除该语言列（未保存前仅影响本页）">✕</button>`, 'col-lang');
+  });
+  html += th('', 'col-del') + '</tr>';
+  thead.innerHTML = html;
+  thead.querySelectorAll('.del-lang').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const lang = btn.dataset.lang;
+      langs = langs.filter((l) => l !== lang);
+      saveLangPrefs();
+      renderHead();
+      rebuildRows();
+    });
+  });
+}
+
+function rowHtml(seq, text, transMap) {
   const tr = document.createElement('tr');
   tr.className = 'entry-row';
-  tr.innerHTML = `
+  let cells = `
     <td class="col-seq"><input type="number" min="1" step="1" class="f-seq" value="${esc(seq)}"></td>
-    <td><textarea rows="1" class="f-text" placeholder="输入字幕内容…">${esc(text)}</textarea></td>
-    <td class="col-del"><button class="del-btn" title="删除此行">✕</button></td>`;
+    <td><textarea rows="1" class="f-text" placeholder="输入原文…">${esc(text)}</textarea></td>`;
+  langs.forEach((lang) => {
+    cells += `<td><textarea rows="1" class="f-trans" data-lang="${esc(lang)}" placeholder="留空=缺条（显示原文）">${esc(transMap[lang] || '')}</textarea></td>`;
+  });
+  cells += `<td class="col-del"><button class="del-btn" title="删除此行">✕</button></td>`;
+  tr.innerHTML = cells;
   tr.querySelector('.del-btn').addEventListener('click', () => { tr.remove(); });
   return tr;
 }
 
-function addRow(seq = '', text = '') {
-  tbody.appendChild(rowHtml(seq, text));
+function addRow(seq = '', text = '', transMap = {}) {
+  tbody.appendChild(rowHtml(seq, text, transMap));
 }
 
-function readRows() {
-  return [...document.querySelectorAll('.entry-row')].map((tr) => ({
-    seq: tr.querySelector('.f-seq').value,
-    text: tr.querySelector('.f-text').value,
-  }));
+function rebuildRows() {
+  const data = readRowsRaw();
+  tbody.innerHTML = '';
+  data.forEach((r) => addRow(r.seq, r.text, r.trans));
+  if (!data.length) addRow();
+}
+
+/** 读取表格：返回原文行 + 按语言分组的非空译文 */
+function readRowsRaw() {
+  return [...document.querySelectorAll('.entry-row')].map((tr) => {
+    const trans = {};
+    tr.querySelectorAll('.f-trans').forEach((ta) => { trans[ta.dataset.lang] = ta.value; });
+    return {
+      seq: tr.querySelector('.f-seq').value,
+      text: tr.querySelector('.f-text').value,
+      trans,
+    };
+  });
+}
+
+function readPayload() {
+  const rows = readRowsRaw();
+  const translations = langs.map((lang) => ({
+    lang,
+    entries: rows
+      .map((r) => ({ seq: r.seq, text: (r.trans[lang] || '').trim() }))
+      .filter((r) => r.text !== ''),
+  })).filter((g) => g.entries.length > 0); // 整列留空视为该语言暂不存在（允许缺条）
+  return {
+    entries: rows.map((r) => ({ seq: r.seq, text: r.text })),
+    translations,
+  };
 }
 
 document.getElementById('add-btn').addEventListener('click', () => addRow());
 
+const LANG_RE = /^[a-zA-Z]{2,3}(?:-[a-zA-Z0-9]{2,8}){0,2}$/;
+document.getElementById('add-lang-btn').addEventListener('click', () => {
+  const input = document.getElementById('new-lang');
+  const lang = input.value.trim().toLowerCase();
+  if (!lang) return toast('请填写语言代码，如 en、ja、zh-hans');
+  if (!LANG_RE.test(lang)) return toast('语言代码格式不正确：字母开头（2~3 位），可带连字符子码，如 zh-hans');
+  if (langs.includes(lang)) return toast(`语言列 ${lang} 已存在`);
+  langs.push(lang);
+  saveLangPrefs();
+  input.value = '';
+  renderHead();
+  rebuildRows();
+});
+
 async function loadDraft() {
-  const { entries } = await Api.get(`/api/sessions/${sid}/draft`);
+  const d = await Api.get(`/api/sessions/${sid}/draft`);
+  // 服务端返回的语言列并入本地布局偏好（去重）
+  const fromServer = d.langs || [];
+  let changed = false;
+  for (const l of fromServer) {
+    if (!langs.includes(l)) { langs.push(l); changed = true; }
+  }
+  if (changed) { saveLangPrefs(); }
+  renderHead();
+  const transBySeq = {};
+  (d.translations || []).forEach((t) => {
+    if (!transBySeq[t.seq]) transBySeq[t.seq] = {};
+    transBySeq[t.seq][t.lang] = t.text;
+  });
   tbody.innerHTML = '';
-  entries.forEach((e) => addRow(e.seq, e.text));
-  if (!entries.length) addRow();
+  d.entries.forEach((e) => addRow(e.seq, e.text, transBySeq[e.seq] || {}));
+  if (!d.entries.length) addRow();
 }
 
 async function loadVersions() {
@@ -102,16 +196,20 @@ async function loadVersions() {
   } else {
     ul.innerHTML = versions.map((v) => {
       const active = liveState && liveState.activeVersionId === v.id;
-      return `<li>
+      const langBadges = (v.langs && v.langs.length)
+        ? `<span class="muted small">语言：原文${v.langs.map((l) => ` · ${esc(l)}`).join('')}</span>`
+        : '<span class="muted small">仅原文</span>';
+      return `<li style="flex-wrap:wrap">
         <span class="vno">v${v.versionNo}</span>
         <span>${fmtTime(v.publishedAt)} · ${v.count} 条</span>
+        ${langBadges}
         ${active ? '<span class="badge live">● 演出中</span>' : ''}
       </li>`;
     }).join('');
   }
   const note = document.getElementById('live-note');
   if (liveState && liveState.activeVersionId) {
-    note.textContent = `当前舞台使用 v${liveState.version.versionNo}；演出进行中即使发布新版本，舞台仍保持原版本，直到操作员结束演出。`;
+    note.textContent = `当前舞台使用 v${liveState.version.versionNo}；演出进行中即使发布新版本，舞台仍保持原版本及其译文，直到操作员结束演出。`;
   } else {
     note.textContent = '当前没有进行中的演出；操作员可在操作员页载入任一已发布版本。';
   }
@@ -119,16 +217,16 @@ async function loadVersions() {
 
 document.getElementById('save-btn').addEventListener('click', async () => {
   try {
-    const r = await Api.put(`/api/sessions/${sid}/draft`, { entries: readRows() });
-    toast(`草稿已保存（${r.count} 条）`, 'ok');
+    const r = await Api.put(`/api/sessions/${sid}/draft`, readPayload());
+    toast(`草稿已保存（${r.count} 条原文${r.langs.length ? '，语言：' + r.langs.join('、') : '，仅原文'}）`, 'ok');
     await loadDraft();
   } catch (err) { toast(err.message); }
 });
 
 document.getElementById('publish-btn').addEventListener('click', async () => {
   try {
-    const v = await Api.post(`/api/sessions/${sid}/publish`, { entries: readRows() });
-    toast(`已发布 v${v.versionNo}（${v.count} 条）。草稿已清空，可继续编排下一版。`, 'ok');
+    const v = await Api.post(`/api/sessions/${sid}/publish`, readPayload());
+    toast(`已发布 v${v.versionNo}（${v.count} 条原文${v.langs.length ? '，语言：' + v.langs.join('、') : '，仅原文'}）。草稿已清空，可继续编排下一版。`, 'ok');
     await Promise.all([loadDraft(), loadVersions()]);
   } catch (err) { toast(err.message); }
 });
@@ -138,6 +236,7 @@ connectWS({
   onState: (st) => { liveState = st; loadVersions(); },
 });
 
+renderHead();
 (async function init() {
   try {
     await Promise.all([loadDraft(), loadVersions()]);
